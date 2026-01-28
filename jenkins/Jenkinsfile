@@ -13,13 +13,9 @@ pipeline {
     ECR_REPO = "ml-infer"
     IMAGE_NAME = "ml-infer"
 
-    // Stable endpoint name (important for updates / rollback)
     ENDPOINT_NAME = "textcls-endpoint-dev"
-
-    // SageMaker execution role (used inside deploy.py)
     SAGEMAKER_EXEC_ROLE = "arn:aws:iam::570617927874:role/sagemaker-textcls-exec-role"
 
-    // Model artifact in S3
     MODEL_DATA_URL = "s3://sameer-ml-artifacts-ap-south-1/ml/textcls/versioned/v3.0.0/saved_model.tar.gz"
   }
 
@@ -32,23 +28,21 @@ pipeline {
     }
 
     stage("Verify tools") {
-        steps {
-            sh """
-            set -e
-            docker --version
-            aws --version
-            """
-        }
-        }
+      steps {
+        sh """
+          set -e
+          docker --version
+          aws --version
+        """
+      }
+    }
 
     stage("Resolve Image Tag") {
       steps {
         script {
           def shortSha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
           env.IMAGE_TAG = "b${env.BUILD_NUMBER}-${shortSha}-amd64-v2"
-
           env.IMAGE_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPO}:${env.IMAGE_TAG}"
-
           echo "Using IMAGE_URI=${env.IMAGE_URI}"
         }
       }
@@ -61,7 +55,6 @@ pipeline {
           usernameVariable: "AWS_ACCESS_KEY_ID",
           passwordVariable: "AWS_SECRET_ACCESS_KEY"
         )]) {
-
           sh """
             set -e
 
@@ -81,64 +74,66 @@ pipeline {
     }
 
     stage("Deploy / Update SageMaker Endpoint") {
-        steps {
-            withCredentials([usernamePassword(
-            credentialsId: "aws-cli",
-            usernameVariable: "AWS_ACCESS_KEY_ID",
-            passwordVariable: "AWS_SECRET_ACCESS_KEY"
-            )]) {
-            sh """
-                set -e
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+          sh """
+            set -e
 
-                docker run --rm \
-                -e AWS_ACCESS_KEY_ID \
-                -e AWS_SECRET_ACCESS_KEY \
-                -e AWS_REGION=${AWS_REGION} \
-                -v "\$PWD:/work" \
-                -w /work \
-                python:3.10-slim bash -lc "
-                    pip install -q boto3 botocore &&
-                    python sagemaker/deploy.py \
-                    --region ${AWS_REGION} \
-                    --image-uri ${IMAGE_URI} \
-                    --model-data-url ${MODEL_DATA_URL} \
-                    --execution-role-arn ${SAGEMAKER_EXEC_ROLE} \
-                    --model-name textcls-model-${IMAGE_TAG} \
-                    --endpoint-config-name textcls-config-${IMAGE_TAG} \
-                    --endpoint-name ${ENDPOINT_NAME}
-                "
-            """
-            }
+            docker run --rm \
+              -e AWS_ACCESS_KEY_ID \
+              -e AWS_SECRET_ACCESS_KEY \
+              -e AWS_REGION=${AWS_REGION} \
+              -v "\$PWD:/work" \
+              -w /work \
+              python:3.10-slim bash -lc "
+                pip install -q boto3 botocore &&
+                python sagemaker/deploy.py \
+                  --region ${AWS_REGION} \
+                  --image-uri ${IMAGE_URI} \
+                  --model-data-url ${MODEL_DATA_URL} \
+                  --execution-role-arn ${SAGEMAKER_EXEC_ROLE} \
+                  --model-name textcls-model-${IMAGE_TAG} \
+                  --endpoint-config-name textcls-config-${IMAGE_TAG} \
+                  --endpoint-name ${ENDPOINT_NAME}
+              "
+          """
         }
-}
+      }
+    }
 
     stage("Smoke Invoke Endpoint") {
-        steps {
-            withCredentials([usernamePassword(
-            credentialsId: "aws-cli",
-            usernameVariable: "AWS_ACCESS_KEY_ID",
-            passwordVariable: "AWS_SECRET_ACCESS_KEY"
-            )]) {
-            sh """
-                set -e
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+          sh """
+            set -e
 
-                docker run --rm \
-                -e AWS_ACCESS_KEY_ID \
-                -e AWS_SECRET_ACCESS_KEY \
-                -e AWS_REGION=${AWS_REGION} \
-                -v "\$PWD:/work" \
-                -w /work \
-                python:3.10-slim bash -lc "
-                    pip install -q boto3 botocore &&
-                    python sagemaker/invoke.py \
-                    --region ${AWS_REGION} \
-                    --endpoint-name ${ENDPOINT_NAME} \
-                    --text 'refund my money'
-                "
-            """
-            }
+            docker run --rm \
+              -e AWS_ACCESS_KEY_ID \
+              -e AWS_SECRET_ACCESS_KEY \
+              -e AWS_REGION=${AWS_REGION} \
+              -v "\$PWD:/work" \
+              -w /work \
+              python:3.10-slim bash -lc "
+                pip install -q boto3 botocore &&
+                python sagemaker/invoke.py \
+                  --region ${AWS_REGION} \
+                  --endpoint-name ${ENDPOINT_NAME} \
+                  --text 'refund my money'
+              "
+          """
         }
-        }
+      }
+    }
+
+  }  // ✅ closes stages
 
   post {
     success {
