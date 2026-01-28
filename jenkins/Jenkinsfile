@@ -98,34 +98,34 @@ pipeline {
     }
 
     stage("Convert OCI -> Docker v2 schema2 (SageMaker compatible)") {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: "aws-cli",
-          usernameVariable: "AWS_ACCESS_KEY_ID",
-          passwordVariable: "AWS_SECRET_ACCESS_KEY"
-        )]) {
-          sh """
-            set -e
-
-            # Get a short-lived ECR password and pass it directly to skopeo
-            PASS=\$(aws ecr get-login-password --region ${AWS_REGION})
-
-            # Use a skopeo container so we don't need skopeo installed in Jenkins host
-            docker run --rm \
-              -e PASS="\$PASS" \
-              quay.io/skopeo/stable:latest sh -lc '
+        steps {
+            withCredentials([usernamePassword(
+            credentialsId: "aws-cli",
+            usernameVariable: "AWS_ACCESS_KEY_ID",
+            passwordVariable: "AWS_SECRET_ACCESS_KEY"
+            )]) {
+            sh """
                 set -e
-                skopeo --version
-                skopeo copy --format v2s2 \
-                  --src-creds "AWS:'"\$PASS"'" \
-                  --dest-creds "AWS:'"\$PASS"'" \
-                  docker://${IMAGE_URI} \
-                  docker://${IMAGE_URI_V2}
-              '
-          """
+
+                PASS=\$(aws ecr get-login-password --region ${AWS_REGION})
+
+                docker run --rm \
+                --entrypoint /bin/sh \
+                -e PASS="\$PASS" \
+                quay.io/skopeo/stable:latest -c '
+                    set -e
+                    skopeo --version
+                    skopeo copy --format v2s2 \
+                    --src-creds "AWS:\$PASS" \
+                    --dest-creds "AWS:\$PASS" \
+                    docker://${IMAGE_URI} \
+                    docker://${IMAGE_URI_V2}
+                '
+            """
+            }
         }
-      }
     }
+
 
     stage("Verify manifest is Docker v2") {
       steps {
