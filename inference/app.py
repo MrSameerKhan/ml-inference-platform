@@ -26,10 +26,10 @@ def load_artifacts():
 
         preprocess = joblib.load(preprocess_path)
 
-        with open(label_map_path, "r") as f:
+        with open(label_map_path, "r", encoding="utf-8") as f:
             label_map = json.load(f)
 
-        with open(metadata_path, "r") as f:
+        with open(metadata_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
 
         artifacts_loaded = True
@@ -53,7 +53,7 @@ def ping():
     if artifacts_loaded:
         return jsonify(status="ok"), 200
     else:
-        return jsonify(status="error", reason="artifacts not loaded"), 500
+        return jsonify(status="error", reason="artifacts not loaded", model_dir=MODEL_DIR), 500
 
 
 @app.route("/invocations", methods=["POST"])
@@ -70,7 +70,7 @@ def invocations():
     response = {
         "received": payload,
         "model_version": metadata.get("model_version"),
-        "available_labels": list(label_map["label_to_id"].keys())
+        "available_labels": list(label_map.get("label_to_id", {}).keys())
     }
 
     return jsonify(response), 200

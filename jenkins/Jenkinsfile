@@ -1,0 +1,21 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION = "ap-south-1"
+  }
+
+  stages {
+    stage('Verify AWS creds') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          sh '''
+            set -e
+            aws --version
+            aws sts get-caller-identity
+          '''
+        }
+      }
+    }
+  }
+}
