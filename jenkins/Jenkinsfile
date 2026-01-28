@@ -1,102 +1,137 @@
 pipeline {
   agent any
 
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+  }
+
   environment {
     AWS_REGION = "ap-south-1"
     AWS_ACCOUNT_ID = "570617927874"
+
     ECR_REPO = "ml-infer"
     IMAGE_NAME = "ml-infer"
+
+    // Stable endpoint name (important for updates / rollback)
+    ENDPOINT_NAME = "textcls-endpoint-dev"
+
+    // SageMaker execution role (used inside deploy.py)
+    SAGEMAKER_EXEC_ROLE = "arn:aws:iam::570617927874:role/sagemaker-textcls-exec-role"
+
+    // Model artifact in S3
+    MODEL_DATA_URL = "s3://sameer-ml-artifacts-ap-south-1/ml/textcls/versioned/v3.0.0/saved_model.tar.gz"
   }
 
   stages {
 
-    stage('Checkout') {
+    stage("Checkout") {
       steps {
         checkout scm
       }
     }
 
-    stage('Verify tools') {
+    stage("Verify tools") {
       steps {
-        sh '''
+        sh """
           set -e
           docker --version
           aws --version
-        '''
+          python --version
+        """
       }
     }
 
-    stage('AWS Identity') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'aws-cli',
-          usernameVariable: 'AWS_ACCESS_KEY_ID',
-          passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-          sh '''
-            set -e
-            aws sts get-caller-identity
-          '''
-        }
-      }
-    }
-
-    stage('Ensure ECR repo') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'aws-cli',
-          usernameVariable: 'AWS_ACCESS_KEY_ID',
-          passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-          sh '''
-            set -e
-            aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
-              || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" >/dev/null
-          '''
-        }
-      }
-    }
-
-    stage('Build Docker image') {
-      steps {
-        sh '''
-          set -e
-          docker build -t ${IMAGE_NAME}:local -f inference/Dockerfile .
-        '''
-      }
-    }
-
-    stage('Login to ECR') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'aws-cli',
-          usernameVariable: 'AWS_ACCESS_KEY_ID',
-          passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-          sh '''
-            set -e
-            aws ecr get-login-password --region "$AWS_REGION" \
-              | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          '''
-        }
-      }
-    }
-
-    stage('Tag & Push') {
+    stage("Resolve Image Tag") {
       steps {
         script {
           def shortSha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          env.IMAGE_TAG = "b${env.BUILD_NUMBER}-${shortSha}"
-          env.ECR_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPO}:${env.IMAGE_TAG}"
-        }
+          env.IMAGE_TAG = "b${env.BUILD_NUMBER}-${shortSha}-amd64-v2"
 
-        sh '''
-          set -e
-          echo "Pushing: $ECR_URI"
-          docker tag ${IMAGE_NAME}:local "$ECR_URI"
-          docker push "$ECR_URI"
-        '''
+          env.IMAGE_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPO}:${env.IMAGE_TAG}"
+
+          echo "Using IMAGE_URI=${env.IMAGE_URI}"
+        }
+      }
+    }
+
+    stage("Build & Push Image to ECR") {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+
+          sh """
+            set -e
+
+            aws ecr get-login-password --region ${AWS_REGION} | \
+              docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+            docker buildx create --name sm-builder --use || true
+
+            docker buildx build \
+              --platform linux/amd64 \
+              -f inference/Dockerfile \
+              -t ${IMAGE_URI} \
+              --push .
+          """
+        }
+      }
+    }
+
+    stage("Deploy / Update SageMaker Endpoint") {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+
+          sh """
+            set -e
+
+            python sagemaker/deploy.py \
+              --region ${AWS_REGION} \
+              --image-uri ${IMAGE_URI} \
+              --model-data-url ${MODEL_DATA_URL} \
+              --execution-role-arn ${SAGEMAKER_EXEC_ROLE} \
+              --model-name textcls-model-${IMAGE_TAG} \
+              --endpoint-config-name textcls-config-${IMAGE_TAG} \
+              --endpoint-name ${ENDPOINT_NAME}
+          """
+        }
+      }
+    }
+
+    stage("Smoke Invoke Endpoint") {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+
+          sh """
+            set -e
+
+            python sagemaker/invoke.py \
+              --region ${AWS_REGION} \
+              --endpoint-name ${ENDPOINT_NAME} \
+              --text "refund my money"
+          """
+        }
       }
     }
   }
 
   post {
     success {
-      echo "ECR image pushed: ${env.ECR_URI}"
+      echo "✅ CI/CD SUCCESS — Image built, endpoint deployed, invocation passed"
+    }
+    failure {
+      echo "❌ CI/CD FAILED — Check logs above"
     }
   }
 }
