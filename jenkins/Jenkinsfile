@@ -13,22 +13,16 @@ pipeline {
     ECR_REPO = "ml-infer"
     IMAGE_NAME = "ml-infer"
 
-    // Stable endpoint name (important for updates / rollback)
     ENDPOINT_NAME = "textcls-endpoint-dev"
-
-    // SageMaker execution role
     SAGEMAKER_EXEC_ROLE = "arn:aws:iam::570617927874:role/sagemaker-textcls-exec-role"
 
-    // Model artifact in S3
     MODEL_DATA_URL = "s3://sameer-ml-artifacts-ap-south-1/ml/textcls/versioned/v3.0.0/saved_model.tar.gz"
   }
 
   stages {
 
     stage("Checkout") {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage("Verify tools") {
@@ -45,11 +39,19 @@ pipeline {
       steps {
         script {
           def shortSha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          // Image tag pattern
+
+          // Base tag built by buildx (often becomes OCI index)
           env.IMAGE_TAG = "b${env.BUILD_NUMBER}-${shortSha}-amd64"
 
-          env.IMAGE_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPO}:${env.IMAGE_TAG}"
-          echo "Using IMAGE_URI=${env.IMAGE_URI}"
+          // Converted tag guaranteed to be Docker v2 schema2 for SageMaker
+          env.IMAGE_TAG_V2 = "${env.IMAGE_TAG}-v2"
+
+          env.ECR_BASE = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPO}"
+          env.IMAGE_URI = "${env.ECR_BASE}:${env.IMAGE_TAG}"
+          env.IMAGE_URI_V2 = "${env.ECR_BASE}:${env.IMAGE_TAG_V2}"
+
+          echo "IMAGE_URI (raw)    = ${env.IMAGE_URI}"
+          echo "IMAGE_URI (v2s2)   = ${env.IMAGE_URI_V2}"
         }
       }
     }
@@ -70,7 +72,7 @@ pipeline {
       }
     }
 
-    stage("Build & Push Image to ECR") {
+    stage("Build & Push Image to ECR (buildx)") {
       steps {
         withCredentials([usernamePassword(
           credentialsId: "aws-cli",
@@ -95,7 +97,7 @@ pipeline {
       }
     }
 
-    stage("Deploy / Update SageMaker Endpoint") {
+    stage("Convert OCI -> Docker v2 schema2 (SageMaker compatible)") {
       steps {
         withCredentials([usernamePassword(
           credentialsId: "aws-cli",
@@ -105,7 +107,56 @@ pipeline {
           sh """
             set -e
 
-            # Run deploy script inside python container, mounting Jenkins workspace via --volumes-from
+            # Get a short-lived ECR password and pass it directly to skopeo
+            PASS=\$(aws ecr get-login-password --region ${AWS_REGION})
+
+            # Use a skopeo container so we don't need skopeo installed in Jenkins host
+            docker run --rm \
+              -e PASS="\$PASS" \
+              quay.io/skopeo/stable:latest sh -lc '
+                set -e
+                skopeo --version
+                skopeo copy --format v2s2 \
+                  --src-creds "AWS:'"\$PASS"'" \
+                  --dest-creds "AWS:'"\$PASS"'" \
+                  docker://${IMAGE_URI} \
+                  docker://${IMAGE_URI_V2}
+              '
+          """
+        }
+      }
+    }
+
+    stage("Verify manifest is Docker v2") {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+          sh """
+            set -e
+            aws ecr batch-get-image \
+              --repository-name ${ECR_REPO} \
+              --image-ids imageTag=${IMAGE_TAG_V2} \
+              --query 'images[].imageManifestMediaType' \
+              --output text \
+              --region ${AWS_REGION}
+          """
+        }
+      }
+    }
+
+    stage("Deploy / Update SageMaker Endpoint (use v2 image)") {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "aws-cli",
+          usernameVariable: "AWS_ACCESS_KEY_ID",
+          passwordVariable: "AWS_SECRET_ACCESS_KEY"
+        )]) {
+          sh """
+            set -e
+
             docker run --rm \
               --volumes-from jenkins \
               -w "${WORKSPACE}" \
@@ -114,14 +165,13 @@ pipeline {
               -e AWS_REGION=${AWS_REGION} \
               python:3.10-slim bash -lc "
                 pip install -q boto3 botocore &&
-                test -f sagemaker/deploy.py &&
                 python sagemaker/deploy.py \
                   --region ${AWS_REGION} \
-                  --image-uri ${IMAGE_URI} \
+                  --image-uri ${IMAGE_URI_V2} \
                   --model-data-url ${MODEL_DATA_URL} \
                   --execution-role-arn ${SAGEMAKER_EXEC_ROLE} \
-                  --model-name textcls-model-${IMAGE_TAG} \
-                  --endpoint-config-name textcls-config-${IMAGE_TAG} \
+                  --model-name textcls-model-${IMAGE_TAG_V2} \
+                  --endpoint-config-name textcls-config-${IMAGE_TAG_V2} \
                   --endpoint-name ${ENDPOINT_NAME}
               "
           """
@@ -147,7 +197,6 @@ pipeline {
               -e AWS_REGION=${AWS_REGION} \
               python:3.10-slim bash -lc "
                 pip install -q boto3 botocore &&
-                test -f sagemaker/invoke.py &&
                 python sagemaker/invoke.py \
                   --region ${AWS_REGION} \
                   --endpoint-name ${ENDPOINT_NAME} \
@@ -162,13 +211,15 @@ pipeline {
 
   post {
     success {
-      echo "✅ CI/CD SUCCESS — Image built, endpoint deployed, invocation passed"
-      echo "Image: ${IMAGE_URI}"
+      echo "✅ CI/CD SUCCESS"
+      echo "Raw Image: ${IMAGE_URI}"
+      echo "SageMaker Image: ${IMAGE_URI_V2}"
       echo "Endpoint: ${ENDPOINT_NAME}"
     }
     failure {
       echo "❌ CI/CD FAILED — Check logs above"
-      echo "Image (if built): ${IMAGE_URI}"
+      echo "Raw Image: ${IMAGE_URI}"
+      echo "Attempted SageMaker Image: ${IMAGE_URI_V2}"
       echo "Endpoint: ${ENDPOINT_NAME}"
     }
   }
